@@ -12,6 +12,11 @@ import { type Update, check } from "@tauri-apps/plugin-updater";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { CommandPalette, Toast, buildCommands, useCommandPalette } from "./CommandPalette";
 import { WorkspaceProvider } from "./Markdown";
+import {
+  nextAbortDraftCandidate,
+  restoreAbortedDraft,
+  type AbortDraftSource,
+} from "./abort-draft";
 import { getLang, setLang, t, useLang } from "./i18n";
 import { I } from "./icons";
 import {
@@ -1319,6 +1324,17 @@ function TabRuntime({
   });
   const wasBusyRef = useRef(false);
   const busyStartedAtRef = useRef<number | null>(null);
+  const abortDraftRef = useRef<string | null>(null);
+  const clearAbortDraft = useCallback(() => {
+    abortDraftRef.current = nextAbortDraftCandidate(abortDraftRef.current, { type: "clear" });
+  }, []);
+  const recordAbortDraft = useCallback((source: AbortDraftSource, text: string) => {
+    abortDraftRef.current = nextAbortDraftCandidate(abortDraftRef.current, {
+      type: "record",
+      source,
+      text,
+    });
+  }, []);
   const openSettingsAt = useCallback((page: SettingsPageId = "general") => {
     setSettingsPage(page);
     setSettingsOpen(true);
@@ -1377,9 +1393,10 @@ function TabRuntime({
     [sendRpc],
   );
   const newChat = useCallback(() => {
+    clearAbortDraft();
     sendRpc({ cmd: "new_chat" });
     dispatch({ t: "clear" });
-  }, [sendRpc]);
+  }, [clearAbortDraft, sendRpc]);
 
   const pickWorkspace = useCallback(async () => {
     try {
@@ -1390,12 +1407,13 @@ function TabRuntime({
         defaultPath: state.settings?.workspaceDir,
       });
       if (typeof picked === "string" && picked.length > 0) {
+        clearAbortDraft();
         saveSettings({ workspaceDir: picked });
       }
     } catch (err) {
       console.error("pickWorkspace failed", err);
     }
-  }, [saveSettings, state.settings?.workspaceDir]);
+  }, [clearAbortDraft, saveSettings, state.settings?.workspaceDir]);
 
   const flashToast = useCallback(
     (msg: string, opts?: { yolo?: boolean; duration?: number }) => {
@@ -1489,6 +1507,7 @@ function TabRuntime({
           return;
         }
         const clientId = `btw-${Date.now()}`;
+        recordAbortDraft("btw", text);
         dispatch({ t: "send_user", text, clientId });
         sendRpc({ cmd: "btw", text: question });
         if (!override) setDraft("");
@@ -1502,6 +1521,7 @@ function TabRuntime({
         if (skill) {
           const clientId = `skill-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
           const trimmedArgs = args?.trim() ?? "";
+          recordAbortDraft("skill_run", text);
           dispatch({ t: "start_skill", skill: { name: skill.name, runAs: skill.runAs }, args: trimmedArgs, clientId });
           sendRpc({ cmd: "skill_run", name: skill.name, args: trimmedArgs || undefined });
           if (!override) setDraft("");
@@ -1509,14 +1529,32 @@ function TabRuntime({
         }
       }
       const clientId = `c-${Date.now()}`;
+      recordAbortDraft("user_input", text);
       dispatch({ t: "send_user", text, clientId });
       sendRpc({ cmd: "user_input", text });
       if (!override) setDraft("");
     },
-    [draft, state.ready, state.busy, state.skills, sendRpc],
+    [draft, state.ready, state.busy, state.skills, sendRpc, recordAbortDraft],
   );
 
-  const abort = useCallback(() => sendRpc({ cmd: "abort" }), [sendRpc]);
+  const abort = useCallback(() => {
+    const restored = restoreAbortedDraft(draft, abortDraftRef.current);
+    clearAbortDraft();
+    if (restored !== null) {
+      setDraft(restored);
+      composerRef.current?.focus();
+    }
+    sendRpc({ cmd: "abort" });
+  }, [clearAbortDraft, draft, sendRpc]);
+
+  useEffect(() => {
+    if (!state.busy) clearAbortDraft();
+  }, [clearAbortDraft, state.busy]);
+
+  const clearConversation = useCallback(() => {
+    clearAbortDraft();
+    dispatch({ t: "clear" });
+  }, [clearAbortDraft]);
 
   // When /retry returns the last user text, set it as the composer draft
   useEffect(() => {
@@ -1776,7 +1814,7 @@ function TabRuntime({
       flashToast(t("app.toast.newSession"));
     },
     clearChat: () => {
-      dispatch({ t: "clear" });
+      clearConversation();
       flashToast(t("app.toast.cleared"));
     },
     focusComposer: () => composerRef.current?.focus(),
@@ -1820,7 +1858,7 @@ function TabRuntime({
       },
     },
     { cmd: "/new", desc: t("app.cmd.newSession"), run: () => newChat(), kb: shortcutText(["mod", "N"]) },
-    { cmd: "/clear", desc: t("app.cmd.clearChat"), run: () => dispatch({ t: "clear" }) },
+    { cmd: "/clear", desc: t("app.cmd.clearChat"), run: () => clearConversation() },
     { cmd: "/abort", desc: t("app.cmd.abort"), run: () => abort(), kb: "esc" },
     {
       cmd: "/copy",
@@ -1895,6 +1933,7 @@ function TabRuntime({
       desc: s.description?.trim() || fallbackSkillDesc(s),
       insertOnly: true,
       run: () => {
+        recordAbortDraft("skill_run", `/${s.name}`);
         dispatch({
           t: "start_skill",
           skill: { name: s.name, runAs: s.runAs },
@@ -1996,7 +2035,7 @@ function TabRuntime({
           onOpenSettings={() => openSettingsAt("general")}
           onCopy={conversationCopy}
           onExport={exportConversation}
-          onClear={() => dispatch({ t: "clear" })}
+          onClear={clearConversation}
           hasMessages={state.messages.length > 0}
         />
 
@@ -2018,7 +2057,10 @@ function TabRuntime({
           sessions={state.sessions}
           activeName={state.currentSession}
           onNewChat={newChat}
-          onLoadSession={(name) => sendRpc({ cmd: "session_load", name })}
+          onLoadSession={(name) => {
+            clearAbortDraft();
+            sendRpc({ cmd: "session_load", name });
+          }}
           onDeleteSession={(name) => sendRpc({ cmd: "session_delete", name })}
           onRenameSession={(name, title) => sendRpc({ cmd: "session_rename", name, title })}
           onOpenSettings={() => openSettingsAt("general")}
@@ -2367,7 +2409,10 @@ function TabRuntime({
           recent={state.settings?.recentWorkspaces ?? []}
           current={state.settings?.workspaceDir}
           anchor={wdAnchor}
-          onPick={(path) => saveSettings({ workspaceDir: path })}
+          onPick={(path) => {
+            clearAbortDraft();
+            saveSettings({ workspaceDir: path });
+          }}
           onBrowse={pickWorkspace}
         />
 
